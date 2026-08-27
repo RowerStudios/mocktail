@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -13,6 +14,9 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <unistd.h>
+#include <limits.h>
+#include <sys/resource.h>
 #include <vector>
 
 #include "compat/elf_build_id.h"
@@ -217,6 +221,206 @@ void PromptFirstLaunchSignIn(
 
 }  // namespace
 
+namespace {
+// Reduce the periodic micro-stutter/hitching that OpenGL apps exhibit on the
+// Pin every online CPU to the "performance" governor so the kernel never
+// downclocks under load. Older CPUs (i7-2600 class) ramp clocks on demand and
+// the resulting latency spikes show up as judder in CPU-bound games. Best
+// effort: sysfs writes need root on most setups, so failures are silently
+// ignored.
+void ApplyCpuPerformanceGovernor() {
+  if (std::getenv("MOCKTAIL_DISABLE_CPU_GOVERNOR") != nullptr) {
+    return;
+  }
+  const long n = sysconf(_SC_NPROCESSORS_ONLN);
+  if (n <= 0) {
+    return;
+  }
+  for (long i = 0; i < n; ++i) {
+    const std::string path = "/sys/devices/system/cpu/cpu" +
+                             std::to_string(i) +
+                             "/cpufreq/scaling_governor";
+    FILE* f = fopen(path.c_str(), "w");
+    if (f != nullptr) {
+      fputs("performance", f);
+      fclose(f);
+    }
+  }
+}
+
+// proprietary NVIDIA Linux driver. These must be applied before the GL driver
+// is loaded (i.e. before window/EGL init), so we set them as early as
+// possible. Each is only set when not already provided by the user.
+void ApplyNvidiaPerformanceTuning() {
+  if (access("/proc/driver/nvidia/version", R_OK) != 0) {
+    return;
+  }
+  std::cerr << "[runtime] NVIDIA GPU detected; applying GL tuning\n";
+
+  auto set_if_unset = [](const char* name, const char* value) {
+    if (std::getenv(name) == nullptr) {
+      setenv(name, value, 1);
+    }
+  };
+
+  // USLEEP yield is the documented fix for the 1-2s periodic stutter on
+  // NVIDIA's OpenGL path (avoids busy-spin waits that desync vsync).
+  set_if_unset("__GL_YIELD", "USLEEP");
+  // Multi-threaded GL command submission.
+  set_if_unset("__GL_THREADED_OPTIMIZATIONS", "1");
+  // Let SDL bypass the X11 compositor for our window (fewer present hops).
+  set_if_unset("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "1");
+  // Allow adaptive sync (G-Sync/FreeSync) when the display supports it.
+  // Harmless and a no-op on fixed-refresh panels like the 84Hz one here.
+  set_if_unset("__GL_VRR_ALLOWED", "1");
+
+  // Texture filtering at "High Performance" trades some sharpness for speed.
+  // This is the single largest driver-side quality-vs-throughput knob and the
+  // user explicitly asked for every performance lever.
+  if (std::getenv("MOCKTAIL_DISABLE_NVIDIA_TEXTURE_PERF") == nullptr) {
+    system("nvidia-settings -a '[gpu:0]/TextureFilteringQuality=0' "
+           ">/dev/null 2>&1");
+  }
+
+  // CPU-side tuning. On an older CPU (e.g. i7-2600) clock ramps and scheduler
+  // jitter cause hitches that no GL flag fixes. Best effort; all ignored if
+  // the user lacks privileges.
+  ApplyCpuPerformanceGovernor();
+  if (std::getenv("MOCKTAIL_DISABLE_RENICE") == nullptr) {
+    if (setpriority(PRIO_PROCESS, 0, -10) != 0) {
+      // Non-fatal; only relevant when CAP_SYS_NICE is unavailable.
+    }
+  }
+
+  // Persist compiled shaders to disk so the "stutter when something new loads"
+  // is a one-time cost. NVIDIA keys the cache per driver + binary, so running
+  // the same mocktail binary reuses it across sessions. Let the driver choose
+  // its per-version default location (~/.nv/GLCache on 390.x,
+  // ~/.cache/nvidia/GLCache on newer drivers) rather than overriding the path,
+  // which older drivers ignore anyway.
+  set_if_unset("__GL_SHADER_DISK_CACHE", "1");
+  set_if_unset("__GL_SHADER_DISK_CACHE_SIZE", "2147483648");
+  // AllowFlipping lets the driver present via page flips, which smooths the
+  // vsync present path and avoids the "alternating frame" judder pattern.
+  if (std::getenv("MOCKTAIL_DISABLE_NVIDIA_FLIP") == nullptr) {
+    system("nvidia-settings -a 'AllowFlipping=1' >/dev/null 2>&1");
+  }
+
+  // Pin the GPU clocks out of the PowerMizer "auto" ramp, which is the most
+  // common cause of periodic hitches. Best effort; ignore if nvidia-settings
+  // is missing or lacks privileges.
+  if (std::getenv("MOCKTAIL_DISABLE_NVIDIA_POWERMIZER_PIN") == nullptr) {
+    int rc = system(
+        "nvidia-settings -a '[gpu:0]/GPUPowerMizerMode=1' >/dev/null 2>&1");
+    if (rc != 0 && rc != 127) {
+      std::cerr << "[runtime] note: could not pin NVIDIA PowerMizer mode\n";
+    }
+  }
+  // Persistence mode keeps the driver initialized so context (re)creation and
+  // mode switches stop causing hitches. Needs root on most setups; best
+  // effort.
+  if (std::getenv("MOCKTAIL_DISABLE_NVIDIA_PERSISTENCE") == nullptr) {
+    system("nvidia-smi -pm 1 >/dev/null 2>&1");
+  }
+}
+
+// Apply the driver-level vsync setting once the config (MOCKTAIL_VSYNC) is in
+// the environment. Called after ExportRuntimeConfigEnvironment so graphics.vsync
+// is honoured: "off" uncaps the frame rate (tearing allowed), anything else
+// syncs to the display vblank.
+void ApplyNvidiaVsyncTuning() {
+  if (access("/proc/driver/nvidia/version", R_OK) != 0) {
+    return;
+  }
+  if (std::getenv("__GL_SYNC_TO_VBLANK") != nullptr) {
+    return;  // user override wins
+  }
+  const char* vsync = std::getenv("MOCKTAIL_VSYNC");
+  bool vsync_off = vsync != nullptr && std::strcmp(vsync, "off") == 0;
+  setenv("__GL_SYNC_TO_VBLANK", vsync_off ? "0" : "1", 1);
+  // Backstop: this EGL driver clamps EGL_MIN_SWAP_INTERVAL to 1, so
+  // eglSwapInterval(0) is rejected. The only reliable way to defeat vsync is
+  // the driver-level SyncToVBlank attribute, mirrored by __GL_SYNC_TO_VBLANK.
+  if (std::getenv("MOCKTAIL_DISABLE_NVIDIA_SYNCTOVRBLANK") == nullptr) {
+    system(vsync_off ? "nvidia-settings -a 'SyncToVBlank=0' >/dev/null 2>&1"
+                     : "nvidia-settings -a 'SyncToVBlank=1' >/dev/null 2>&1");
+  }
+  std::cerr << "[runtime] NVIDIA driver vsync "
+            << (vsync_off ? "disabled (vsync=off)\n" : "enabled\n");
+}
+
+// Re-exec the current process with NVIDIA-specific preloads so the driver
+// optimizations actually engage. Must run before EGL is loaded.
+//   - libpthread.so.0: NVIDIA's documented requirement for
+//     __GL_THREADED_OPTIMIZATIONS to take effect.
+//   - libmocktail_egl_vsync_shim.so: only when MOCKTAIL_VSYNC=off, forces
+//     Roblox's eglSwapInterval(1) requests to 0.
+// No-op if there is nothing to add or it is already preloaded (avoids an
+// exec loop).
+void ReexecWithNvidiaPreloads(char* const argv[]) {
+  if (access("/proc/driver/nvidia/version", R_OK) != 0) {
+    return;
+  }
+  const char* vsync = std::getenv("MOCKTAIL_VSYNC");
+  const bool vsync_off =
+      vsync != nullptr && std::strcmp(vsync, "off") == 0;
+
+  char self_exe[PATH_MAX];
+  const ssize_t len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+  if (len < 0) {
+    return;
+  }
+  self_exe[len] = '\0';
+  const std::string exe(self_exe);
+  const std::string::size_type slash = exe.find_last_of('/');
+  const std::string dir =
+      (slash == std::string::npos ? std::string(".") : exe.substr(0, slash + 1));
+
+  const char* existing = std::getenv("LD_PRELOAD");
+  auto present = [existing](const char* lib) {
+    return existing != nullptr && std::strstr(existing, lib) != nullptr;
+  };
+
+  std::string additions;
+  auto append = [&](const std::string& lib) {
+    if (!additions.empty()) {
+      additions += ':';
+    }
+    additions += lib;
+  };
+
+  // Threaded optimizations historically needed libpthread preloaded to
+  // activate, but on glibc >= 2.34 (current Arch) libpthread is merged into
+  // libc and force-preloading it can break TLS. The binary already links
+  // pthread via std::thread/SDL, so it is opt-in only via
+  // MOCKTAIL_NVIDIA_PRELOAD_PTHREAD=1.
+  if (std::getenv("MOCKTAIL_NVIDIA_PRELOAD_PTHREAD") != nullptr &&
+      !present("libpthread.so.0")) {
+    append("libpthread.so.0");
+  }
+
+  if (vsync_off) {
+    const std::string shim = dir + "libmocktail_egl_vsync_shim.so";
+    if (access(shim.c_str(), R_OK) == 0 &&
+        !present("libmocktail_egl_vsync_shim.so")) {
+      append(shim);
+    }
+  }
+
+  if (additions.empty()) {
+    return;
+  }
+  std::string new_preload = additions;
+  if (existing != nullptr && existing[0] != '\0') {
+    new_preload += ':';
+    new_preload += existing;
+  }
+  setenv("LD_PRELOAD", new_preload.c_str(), 1);
+  execv(self_exe, argv);
+  std::cerr << "[runtime] note: could not re-exec with NVIDIA preloads\n";
+}
+}  // namespace
+
 int main(int argc, char* argv[]) {
   const auto process_started_at = std::chrono::system_clock::now();
   mocktail::runtime::CommandLineParseResult command_line =
@@ -244,6 +448,8 @@ int main(int argc, char* argv[]) {
     std::cerr << command_line_error << '\n';
     return EXIT_FAILURE;
   }
+
+  ApplyNvidiaPerformanceTuning();
 
   const mocktail::runtime::ProcessEnvironment environment;
   const std::string built_in_compatibility_manifest = environment.GetOr(
@@ -469,6 +675,14 @@ int main(int argc, char* argv[]) {
                       : "")
               << '\n';
   }
+  if (const int gles_version =
+          runtime_config.config.system_egl_gles_version();
+      gles_version != 0 &&
+      std::getenv("MOCKTAIL_SYSTEM_GLES_VERSION") == nullptr) {
+    const char* value =
+        gles_version == 32 ? "32" : gles_version == 31 ? "31" : "30";
+    setenv("MOCKTAIL_SYSTEM_GLES_VERSION", value, 1);
+  }
 
   // Register before starting helper processes or loading the Android payload.
   // libgamemode caches its shared
@@ -681,6 +895,8 @@ int main(int argc, char* argv[]) {
     std::cerr << command_line_error << '\n';
     return EXIT_FAILURE;
   }
+  ApplyNvidiaVsyncTuning();
+  ReexecWithNvidiaPreloads(argv);
   if (command_line.options.mode == mocktail::runtime::CommandMode::kRun &&
       !environment.HasNonEmpty("MOCKTAIL_NATIVE_SET_DEFAULT_POLICY_FILE") &&
       setenv("MOCKTAIL_NATIVE_SET_DEFAULT_POLICY_FILE", "1", 1) != 0) {

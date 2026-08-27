@@ -862,6 +862,44 @@ Status ConfigureWindowStatePersistence(const std::filesystem::path& path) {
   return Status::Ok();
 }
 
+static void ApplySwapInterval() {
+  // Present pacing for the host GL window. Adaptive vsync (-1) prevents the
+  // classic "frame missed vblank -> drop to half refresh" stutter that plagues
+  // OpenGL games on Linux; fall back to hard vsync (1). Honour MOCKTAIL_VSYNC
+  // (auto/on/off) from the graphics.vsync config option.
+  const char* vsync = GetEnvNonEmpty("MOCKTAIL_VSYNC");
+  int interval = 1;
+  bool try_adaptive = true;
+  if (vsync != nullptr) {
+    if (StringEquals(vsync, "off")) {
+      interval = 0;
+      try_adaptive = false;
+    } else if (StringEquals(vsync, "on")) {
+      interval = 1;
+      try_adaptive = false;
+    }
+  }
+  if (try_adaptive) {
+    if (SDL_GL_SetSwapInterval(-1) == 0) {
+      if (WindowTraceEnabled()) {
+        fprintf(stderr, "  [window] swap interval -> adaptive vsync (-1)\n");
+      }
+      return;
+    }
+    if (WindowTraceEnabled()) {
+      fprintf(stderr,
+              "  [window] adaptive vsync unsupported (%s); using hard vsync\n",
+              SDL_GetError());
+    }
+  }
+  if (SDL_GL_SetSwapInterval(interval) != 0) {
+    fprintf(stderr, "  [window] SDL_GL_SetSwapInterval(%d) failed: %s\n",
+            interval, SDL_GetError());
+  } else if (WindowTraceEnabled()) {
+    fprintf(stderr, "  [window] swap interval -> %d\n", interval);
+  }
+}
+
 bool Init(int width, int height, const char* title) {
   if (g_state.initialised) {
     return true;
@@ -1206,6 +1244,8 @@ bool Init(int width, int height, const char* title) {
         g_state.egl_display, g_state.egl_config, g_state.egl_surface,
         g_state.egl_context);
   }
+
+  ApplySwapInterval();
 
   ResolveNativeWindowHandle();
 

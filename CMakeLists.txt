@@ -626,6 +626,23 @@ target_compile_definitions(mocktail_legacy_runtime PRIVATE
 add_executable(mocktail src/main.cc)
 target_include_directories(mocktail PRIVATE include src)
 mocktail_apply_compile_options(mocktail)
+
+# GLES version-pin shim for the system-egl (OpenGL) backend. Loaded in place of
+# the host libEGL.so so eglCreateContext/eglGetProcAddress can force the GLES
+# major/minor requested via MOCKTAIL_SYSTEM_GLES_VERSION.
+add_library(mocktail_egl_shim SHARED src/graphics/egl_version_shim.cc)
+target_link_libraries(mocktail_egl_shim PRIVATE EGL ${CMAKE_DL_LIBS})
+set_target_properties(mocktail_egl_shim PROPERTIES
+  OUTPUT_NAME mocktail_egl_shim
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_dependencies(mocktail mocktail_egl_shim)
+
+add_library(mocktail_egl_vsync_shim SHARED src/graphics/egl_swap_interval_shim.cc)
+target_link_libraries(mocktail_egl_vsync_shim PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(mocktail_egl_vsync_shim PROPERTIES
+  OUTPUT_NAME mocktail_egl_vsync_shim
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_dependencies(mocktail mocktail_egl_vsync_shim)
 target_compile_definitions(mocktail PRIVATE
   "MOCKTAIL_DEFAULT_COMPATIBILITY_MANIFEST=\"${MOCKTAIL_DEFAULT_COMPATIBILITY_MANIFEST}\""
 )

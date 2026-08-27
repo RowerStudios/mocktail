@@ -53,6 +53,8 @@
 #include "libc_shim/libc_shim.h"
 #include "linker/linker.h"
 #include "mocktail/graphics/bionic_egl_bridge.h"
+#include "mocktail/graphics/system_egl_bridge.h"
+#include "mocktail/graphics/system_egl_probe.h"
 #include "runtime/environment.h"
 #include "runtime/discord_rpc.h"
 #include "runtime/jnivm_platform_web_callbacks.h"
@@ -32283,23 +32285,63 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
   // by SONAME: Chromium ANGLE also calls itself libEGL.so and would otherwise
   // win once the SDL backend has loaded it.
   mocktail::graphics::BionicEglBridge bionic_egl_bridge;
+  mocktail::graphics::SystemEglBridge system_egl_bridge;
+  const bool use_system_egl = IsEnabled("MOCKTAIL_DISABLE_AUTO_ANGLE_FALLBACK");
   if (has_window) {
-    if (!bionic_egl_bridge.Load()) {
-      std::cerr << "  [graphics] exact Bionic EGL adapter unavailable: "
-                << bionic_egl_bridge.error() << '\n';
-      if (IsEnabled("MOCKTAIL_REQUIRE_REAL_GRAPHICS")) {
-        std::cerr << "[FATAL] Windowed mode requires Mocktail's exact "
-                     "Bionic EGL adapter.\n";
-        return EXIT_FAILURE;
+    if (use_system_egl) {
+      // The OpenGL/system-egl backend routes the guest's libEGL.so and
+      // libGLESv2.so directly at the host system GL stack instead of ANGLE.
+      const mocktail::graphics::BackendCapability system_egl_capability =
+          mocktail::graphics::ProbeSystemEgl(
+              mocktail::graphics::SystemEglProbeOptions{});
+      if (system_egl_capability.state ==
+          mocktail::graphics::CapabilityState::kUnavailable) {
+        std::cerr << "  [graphics] system EGL probe failed: "
+                  << system_egl_capability.detail << '\n';
       }
-    } else {
-      for (const auto& [name, address] : bionic_egl_bridge.exports()) {
-        linker::RegisterSyntheticSymbol("libEGL.so", name, address);
-        linker::RegisterSymbol(name, address);
+      if (!system_egl_bridge.Load()) {
+        std::cerr << "  [graphics] system EGL bridge unavailable: "
+                  << system_egl_bridge.error() << '\n';
+        if (IsEnabled("MOCKTAIL_REQUIRE_REAL_GRAPHICS")) {
+          std::cerr << "[FATAL] OpenGL backend requested but the host system "
+                       "EGL/GLES stack could not be loaded.\n";
+          return EXIT_FAILURE;
+        }
+      } else {
+        for (const auto& [name, address] : system_egl_bridge.exports()) {
+          linker::RegisterSyntheticSymbol("libEGL.so", name, address);
+          linker::RegisterSyntheticSymbol("libGLESv2.so", name, address);
+          linker::RegisterSymbol(name, address);
+        }
+        std::cout << "  [graphics] system EGL backend loaded from "
+                  << system_egl_bridge.egl_library_path() << " + "
+                  << system_egl_bridge.gles_library_path() << " ("
+                  << system_egl_bridge.exports().size() << " exports)\n";
+        if (system_egl_capability.state ==
+            mocktail::graphics::CapabilityState::kUnavailable) {
+          std::cerr << "  [warn]  system EGL probe reported the host stack is "
+                       "unavailable; rendering may fail.\n";
+        }
       }
-      std::cout << "  [graphics] Bionic libEGL adapter loaded from "
-                << bionic_egl_bridge.library_path() << " ("
-                << bionic_egl_bridge.exports().size() << " exports)\n";
+    }
+    if (!use_system_egl || !system_egl_bridge.IsLoaded()) {
+      if (!bionic_egl_bridge.Load()) {
+        std::cerr << "  [graphics] exact Bionic EGL adapter unavailable: "
+                  << bionic_egl_bridge.error() << '\n';
+        if (IsEnabled("MOCKTAIL_REQUIRE_REAL_GRAPHICS")) {
+          std::cerr << "[FATAL] Windowed mode requires Mocktail's exact "
+                       "Bionic EGL adapter.\n";
+          return EXIT_FAILURE;
+        }
+      } else {
+        for (const auto& [name, address] : bionic_egl_bridge.exports()) {
+          linker::RegisterSyntheticSymbol("libEGL.so", name, address);
+          linker::RegisterSymbol(name, address);
+        }
+        std::cout << "  [graphics] Bionic libEGL adapter loaded from "
+                  << bionic_egl_bridge.library_path() << " ("
+                  << bionic_egl_bridge.exports().size() << " exports)\n";
+      }
     }
   }
 
@@ -32318,8 +32360,15 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
   for (const char* name : stub_names) {
     void* h = nullptr;
     bool exact_adapter = false;
-    if (std::strcmp(name, "libEGL.so") == 0 &&
-        bionic_egl_bridge.IsLoaded()) {
+    if (std::strcmp(name, "libEGL.so") == 0 && system_egl_bridge.IsLoaded()) {
+      h = system_egl_bridge.handle();
+      exact_adapter = true;
+    } else if (std::strcmp(name, "libGLESv2.so") == 0 &&
+               system_egl_bridge.IsLoaded()) {
+      h = system_egl_bridge.gles_handle();
+      exact_adapter = true;
+    } else if (std::strcmp(name, "libEGL.so") == 0 &&
+               bionic_egl_bridge.IsLoaded()) {
       h = bionic_egl_bridge.handle();
       exact_adapter = true;
     } else if (std::strcmp(name, "libvulkan.so") == 0) {
