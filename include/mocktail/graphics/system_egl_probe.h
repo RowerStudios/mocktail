@@ -8,21 +8,24 @@
 namespace mocktail {
 namespace graphics {
 
-// Options for probing the host system OpenGL/EGL stack. When the library paths
-// are left empty the loader resolves the platform SONAMEs (libEGL.so.1 and
-// libGLESv2.so.2) from the host loader search path rather than from a pinned
-// ANGLE or Mocktail bridge distribution.
+// Options for probing the host system OpenGL/EGL stack.
+//
+// The probe creates a real, hidden SDL window and an OpenGL ES context on the
+// host EGL driver Mocktail actually uses at runtime (SDL owns the EGL
+// display/context), then validates the context and classifies acceleration by
+// inspecting the GL_RENDERER/GL_VENDOR strings. This exercises the same driver
+// and on-screen window path as the real presentation window, unlike a
+// surfaceless pbuffer probe which can pass while the on-screen path fails, and
+// it uses the same EGL library SDL loads rather than a separately resolved one.
 struct SystemEglProbeOptions {
-  std::string egl_library_path;
-  std::string gles_library_path;
+  // Requested OpenGL ES version. Defaults to 3.0.
+  int gles_major = 3;
+  int gles_minor = 0;
   bool allow_software_device = false;
 };
 
-// Loads the host system EGL/GLES pair, initializes a surfaceless EGL display,
-// and validates a real OpenGL ES context. No draw calls are issued. The result
-// reports hardware vs software acceleration by inspecting the GL_RENDERER and
-// GL_VENDOR strings (llvmpipe, swiftshader, softpipe and similar are treated as
-// software rasterizers).
+// Probes the host system EGL/GLES stack through a real SDL window. No draw
+// calls are issued. The result reports hardware vs software acceleration.
 BackendCapability ProbeSystemEgl(const SystemEglProbeOptions& options);
 
 }  // namespace graphics

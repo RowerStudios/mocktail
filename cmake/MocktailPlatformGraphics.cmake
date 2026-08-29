@@ -98,6 +98,7 @@ target_include_directories(mocktail_graphics_foundation
 )
 target_link_libraries(mocktail_graphics_foundation PRIVATE
   Mocktail::AngleHeaders
+  SDL3::SDL3
   ${CMAKE_DL_LIBS}
 )
 target_compile_features(mocktail_graphics_foundation PUBLIC cxx_std_17)
@@ -137,6 +138,7 @@ if(BUILD_TESTING AND TARGET GTest::gtest_main)
   )
   target_link_libraries(system_egl_probe_test PRIVATE
     Mocktail::GraphicsFoundation
+    SDL3::SDL3
     GTest::gtest_main
   )
   add_executable(display_refresh_capabilities_test
